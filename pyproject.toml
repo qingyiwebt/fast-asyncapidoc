@@ -2,12 +2,44 @@
 name = "fast-asyncapidoc"
 version = "0.1.0"
 description = "Generate AsyncAPI 3 documentation for FastAPI WebSocket endpoints"
-readme = "README.md"
+readme = { file = "README.md", content-type = "text/markdown" }
+authors = [
+    { name = "qingyiwebt", email = "qingyiweb@gmail.com" },
+]
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = [
+    "asyncapi",
+    "documentation",
+    "fastapi",
+    "pydantic",
+    "websocket",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Documentation",
+    "Topic :: Internet",
+    "Topic :: Software Development :: Libraries",
+]
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.100,<1",
     "pydantic>=2,<3",
 ]
+
+[project.urls]
+Homepage = "https://github.com/qingyiwebt/fast-asyncapidoc"
+Repository = "https://github.com/qingyiwebt/fast-asyncapidoc"
+Documentation = "https://github.com/qingyiwebt/fast-asyncapidoc#readme"
+Issues = "https://github.com/qingyiwebt/fast-asyncapidoc/issues"
 
 [project.optional-dependencies]
 yaml = [
@@ -17,6 +49,9 @@ yaml = [
 [build-system]
 requires = ["uv_build>=0.9.11,<0.10.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+source-include = ["README.zh-CN.md"]
 
 [dependency-groups]
 dev = [

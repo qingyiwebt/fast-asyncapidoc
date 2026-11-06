@@ -1,9 +1,42 @@
 # fast-asyncapidoc
 
-Generate AsyncAPI 3.0 documentation for FastAPI WebSocket endpoints using
-Pydantic v2 models.
+[简体中文](https://github.com/qingyiwebt/fast-asyncapidoc/blob/main/README.zh-CN.md)
 
-## Usage
+Generate [AsyncAPI 3.0](https://www.asyncapi.com/docs/reference/specification/v3.0.0)
+documentation for [FastAPI](https://fastapi.tiangolo.com/) WebSocket endpoints
+using [Pydantic v2](https://docs.pydantic.dev/latest/).
+
+## Features
+
+- Describe WebSocket messages with repeatable `@asyncapi` decorators.
+- Generate AsyncAPI channels, operations, messages, and Pydantic schemas.
+- Document request/reply, receive-only, and server-push interactions.
+- Discover routes from direct FastAPI routes, routers, prefixes, and nested routers.
+- Mount the generated document at a JSON endpoint or export it as a Python `dict`.
+- Optionally serialize the document as YAML.
+- Keep endpoint functions unchanged, including their FastAPI dependency signatures.
+
+## Requirements
+
+- Python 3.10 or newer
+- FastAPI `>=0.100,<1`
+- Pydantic `>=2,<3`
+
+## Installation
+
+Install the package with uv:
+
+```bash
+uv add fast-asyncapidoc
+```
+
+Install optional YAML support when needed:
+
+```bash
+uv add "fast-asyncapidoc[yaml]"
+```
+
+## Quick start
 
 ```python
 from fastapi import APIRouter, FastAPI, WebSocket
@@ -24,16 +57,32 @@ class ControlFailure(BaseModel):
     error: str
 
 
+class ServerNotice(BaseModel):
+    message: str
+
+
 router = APIRouter()
 
 
 @router.websocket("/control")
 @asyncapi(
     input=ControlRequest,
+    output=ControlSuccess,
+    operation_id="control.request_reply",
+    summary="Handle a control request",
+)
+@asyncapi(
+    input=ControlRequest,
     outputs=[ControlSuccess, ControlFailure],
-    operation_id="control",
-    summary="Control the connected device",
-    tags=["control"],
+    operation_id="control.result",
+)
+@asyncapi(
+    input=ControlRequest,
+    operation_id="control.receive_only",
+)
+@asyncapi(
+    output=ServerNotice,
+    operation_id="control.server_notice",
 )
 async def control(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -47,6 +96,7 @@ asyncapi_doc = AsyncAPIDoc(
     app,
     title="Control API",
     version="1.0.0",
+    description="WebSocket API documentation",
     servers={
         "development": {
             "host": "localhost:8000",
@@ -57,26 +107,48 @@ asyncapi_doc = AsyncAPIDoc(
 asyncapi_doc.mount("/asyncapi.json")
 ```
 
-服务器主动推送可以只声明输出模型。此时生成的 operation 使用
-`action: send`，输出消息直接放在 operation 的 `messages` 中：
+The generated document is available at `GET /asyncapi.json` and can also be
+obtained directly:
 
 ```python
-@router.websocket("/events")
-@asyncapi(outputs=[ControlSuccess, ControlFailure], operation_id="events")
-async def events(websocket: WebSocket) -> None:
-    await websocket.accept()
-    await websocket.send_json({"accepted": True})
+document: dict = asyncapi_doc.generate()
 ```
 
-也可以声明 `@asyncapi(input=Request)` 表示接收消息但不回应，或同时声明
-输入和输出表示 request/reply。
+## Decorator semantics
 
-`asyncapi_doc.generate()` returns the document as a Python dictionary. The
-optional YAML serializer is available with:
+`@asyncapi` accepts either a singular or plural form for each direction:
 
-```bash
-uv add --optional yaml PyYAML
+```python
+@asyncapi(input=Request)
+@asyncapi(inputs=[RequestA, RequestB])
+@asyncapi(output=Response)
+@asyncapi(outputs=[Success, Failure])
 ```
+
+The supported combinations are:
+
+| Inputs | Outputs | AsyncAPI operation |
+| --- | --- | --- |
+| One or more | None | `action: receive`, without `reply` |
+| One or more | One or more | `action: receive`, with `reply` |
+| None | One or more | `action: send`, for server push |
+
+An empty declaration is invalid. `input` and `inputs` cannot be used together,
+and the same applies to `output` and `outputs`.
+
+The decorator supports the following operation metadata:
+
+- `operation_id`: explicit key in the AsyncAPI `operations` map.
+- `title`, `summary`, `description`: operation documentation.
+- `tags`: operation grouping tags.
+
+The message payload schema is generated from each Pydantic model's
+`model_json_schema()` output. The package documents message contracts; it does
+not parse, validate, or transform runtime WebSocket frames.
+
+## YAML export
+
+After installing the `yaml` extra:
 
 ```python
 yaml_document = asyncapi_doc.to_yaml()
@@ -84,9 +156,24 @@ yaml_document = asyncapi_doc.to_yaml()
 
 ## Development
 
+This repository uses uv for dependency management and builds:
+
 ```bash
 uv sync
 uv run pytest
 uv run ruff check .
+uv run ruff format --check .
 uv build
 ```
+
+## Links
+
+- [AsyncAPI 3.0 specification](https://www.asyncapi.com/docs/reference/specification/v3.0.0)
+- [FastAPI WebSockets](https://fastapi.tiangolo.com/advanced/websockets/)
+- [Pydantic](https://docs.pydantic.dev/latest/)
+- [uv](https://docs.astral.sh/uv/)
+- [Repository](https://github.com/qingyiwebt/fast-asyncapidoc)
+
+## License
+
+[MIT License](LICENSE)
