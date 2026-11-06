@@ -1,31 +1,26 @@
 # fast-asyncapidoc
 
-[English](README.md)
+[English](https://github.com/qingyiwebt/fast-asyncapidoc/blob/main/README.md)
 
-使用 [Pydantic v2](https://docs.pydantic.dev/latest/) 模型，为
-[FastAPI](https://fastapi.tiangolo.com/) WebSocket endpoint 生成
+使用 Pydantic v2 模型，为 FastAPI WebSocket endpoint 生成
 [AsyncAPI 3.0](https://www.asyncapi.com/docs/reference/specification/v3.0.0)
 文档。
 
 ## 特性
 
-- 使用可重复的 `@asyncapi` 装饰器描述 WebSocket 消息。
-- 自动生成 AsyncAPI channels、operations、messages 和 Pydantic schemas。
-- 支持请求/响应、只接收消息和服务器主动推送。
-- 支持直接注册的 WebSocket、APIRouter、路由前缀和嵌套路由。
-- 可挂载 JSON 文档路由，也可直接导出 Python `dict`。
-- 可选导出 YAML 文档。
-- 不包装 endpoint，不影响 FastAPI 依赖注入和函数签名。
+- 在 endpoint、channel 和 Pydantic 模型附近直接声明协议元数据。
+- 支持请求/响应、客户端发送但不响应、服务器主动推送。
+- 保留 Pydantic 的 `$defs`、字段描述、枚举和校验约束。
+- 支持直接注册的 WebSocket、路由前缀和嵌套路由。
+- 从 FastAPI 的 `Query`、`Header`、`Cookie` 参数推断 AsyncAPI 安全方案。
+- 支持挂载 JSON 和可选 YAML 文档路由。
+- 不包装 endpoint，不影响 FastAPI 依赖注入和原始函数签名。
 
-## 环境要求
+## 环境要求与安装
 
 - Python 3.10 或更高版本
 - FastAPI `>=0.100,<1`
 - Pydantic `>=2,<3`
-
-## 安装
-
-使用 uv 安装：
 
 ```bash
 uv add fast-asyncapidoc
@@ -43,19 +38,25 @@ uv add "fast-asyncapidoc[yaml]"
 from fastapi import APIRouter, FastAPI, WebSocket
 from pydantic import BaseModel
 
-from fast_asyncapidoc import AsyncAPIDoc, asyncapi
+from fast_asyncapidoc import (
+    AsyncAPIDoc,
+    asyncapi_channel,
+    asyncapi_message,
+    asyncapi_operation,
+)
 
 
+@asyncapi_message(
+    title="控制请求",
+    description="客户端发送的控制命令。",
+    examples=[{"name": "status", "payload": {"command": "status"}}],
+)
 class ControlRequest(BaseModel):
     command: str
 
 
-class ControlSuccess(BaseModel):
+class ControlResponse(BaseModel):
     accepted: bool
-
-
-class ControlFailure(BaseModel):
-    error: str
 
 
 class ServerNotice(BaseModel):
@@ -66,24 +67,22 @@ router = APIRouter()
 
 
 @router.websocket("/control")
-@asyncapi(
+@asyncapi_channel(description="控制端 WebSocket channel。")
+@asyncapi_operation(
     input=ControlRequest,
-    output=ControlSuccess,
+    output=ControlResponse,
     operation_id="control.request_reply",
     summary="处理控制请求",
 )
-@asyncapi(
-    input=ControlRequest,
-    outputs=[ControlSuccess, ControlFailure],
-    operation_id="control.result",
-)
-@asyncapi(
+@asyncapi_operation(
     input=ControlRequest,
     operation_id="control.receive_only",
+    summary="处理无响应命令",
 )
-@asyncapi(
+@asyncapi_operation(
     output=ServerNotice,
     operation_id="control.server_notice",
+    summary="接收服务端通知",
 )
 async def control(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -106,57 +105,108 @@ asyncapi_doc = AsyncAPIDoc(
     },
 )
 asyncapi_doc.mount("/asyncapi.json")
+asyncapi_doc.mount_yaml("/asyncapi.yaml")
 ```
 
-生成的文档可以通过 `GET /asyncapi.json` 访问，也可以直接获取：
+`mount_yaml()` 需要安装 `yaml` extra。生成的文档可以通过
+`GET /asyncapi.json` 和 `GET /asyncapi.yaml` 访问，也可以直接调用
+`asyncapi_doc.generate()` 获取 Python `dict`。
+
+## Operation 方向
+
+`input` 和 `output` 仍然相对于 endpoint 函数描述：input 是 endpoint
+收到的消息，output 是 endpoint 发出的消息。`AsyncAPIDoc` 默认使用
+`perspective="client"`，因此生成的 operation 描述 WebSocket 客户端：
+
+| Endpoint 声明 | 客户端 operation |
+| --- | --- |
+| `input=Request` | `action: send` |
+| `input=Request, output=Response` | `action: send`，带 `reply` |
+| `output=Event` | `action: receive` |
+
+如果要描述后端应用本身，可以使用 `perspective="server"`。单个 operation
+也可以覆盖自动方向：
 
 ```python
-document: dict = asyncapi_doc.generate()
+@asyncapi_operation(
+    output=Event,
+    operation_id="special_event",
+    action="send",
+)
 ```
 
-## 装饰器语义
+只有 output 的声明永远不会生成 `reply`；在客户端视角下，它表示服务端主动
+推送的消息。
 
-输入和输出都支持单数或复数形式：
+## Message 元数据
+
+Message 元数据直接挂在 Pydantic 类型上，不再需要生成文档后按 operation ID
+查找并修改：
 
 ```python
-@asyncapi(input=Request)
-@asyncapi(inputs=[RequestA, RequestB])
-@asyncapi(output=Response)
-@asyncapi(outputs=[Success, Failure])
+@asyncapi_message(
+    title="登录请求",
+    description="客户端登录。",
+    correlation_id={
+        "description": "请求关联值。",
+        "location": "$message.payload#/echo",
+    },
+    examples=[
+        {
+            "name": "login",
+            "payload": {"type": "login", "access_token": "<JWT>"},
+        }
+    ],
+)
+class LoginRequest(BaseModel):
+    type: str
+    access_token: str
 ```
 
-支持以下组合：
+同一个模型在多个 operation 中使用时，会复用相同的 message 元数据。
+Pydantic 的 `model_config.json_schema_extra` 仍然只用于 schema 级元数据。
+其他 AsyncAPI Message Object 字段或 `x-*` 扩展可以放在 `extra={...}` 中。
+生成器负责的 `name`、`contentType` 和 `payload` 不允许覆盖。
 
-| 输入 | 输出 | AsyncAPI operation |
-| --- | --- | --- |
-| 一个或多个 | 无 | `action: receive`，不生成 `reply` |
-| 一个或多个 | 一个或多个 | `action: receive`，生成 `reply` |
-| 无 | 一个或多个 | `action: send`，表示服务器主动推送 |
+## 参数级安全方案
 
-输入和输出同时为空的声明无效。`input` 和 `inputs` 不能同时使用，
-`output` 和 `outputs` 也不能同时使用。
-
-装饰器支持以下 operation 元数据：
-
-- `operation_id`：AsyncAPI `operations` map 中的显式 key。
-- `title`、`summary`、`description`：operation 文档信息。
-- `tags`：operation 分组标签。
-
-消息 payload schema 直接来自 Pydantic 模型的
-`model_json_schema()`。本项目只负责生成消息契约，不会解析、校验或转换
-运行时 WebSocket frame。
-
-## YAML 导出
-
-安装 `yaml` 可选依赖后：
+使用 `AsyncAPISecurity` 标记 FastAPI 参数后，package 会自动注册安全方案，并
+将它应用到该 endpoint 的全部 operation：
 
 ```python
-yaml_document = asyncapi_doc.to_yaml()
+from typing import Annotated
+
+from fastapi import Query
+from fast_asyncapidoc import AsyncAPISecurity
+
+
+async def control(
+    websocket: WebSocket,
+    appkey: Annotated[
+        str | None,
+        AsyncAPISecurity(
+            scheme_id="controlAppKey",
+            description="控制端设备 AppKey。",
+        ),
+    ] = Query(default=None),
+) -> None: ...
 ```
+
+参数位置从 `Query`、`Header` 或 `Cookie` 推断；如果设置了 alias，则 alias
+会作为安全方案的参数名。
+
+## 从 0.1 升级
+
+0.2 是有意的破坏性升级：
+
+- `@asyncapi` 改名为 `@asyncapi_operation`。
+- 新增 `@asyncapi_channel` 和 `@asyncapi_message`。
+- 默认 perspective 从 `server` 改为 `client`。
+- 如需旧的 operation 方向，请设置 `perspective="server"`。
 
 ## 开发
 
-本项目使用 uv 管理依赖和构建：
+本项目使用 uv 管理依赖、锁文件、测试和构建：
 
 ```bash
 uv sync
@@ -165,14 +215,6 @@ uv run ruff check .
 uv run ruff format --check .
 uv build
 ```
-
-## 相关链接
-
-- [AsyncAPI 3.0 规范](https://www.asyncapi.com/docs/reference/specification/v3.0.0)
-- [FastAPI WebSockets](https://fastapi.tiangolo.com/advanced/websockets/)
-- [Pydantic](https://docs.pydantic.dev/latest/)
-- [uv](https://docs.astral.sh/uv/)
-- [项目仓库](https://github.com/qingyiwebt/fast-asyncapidoc)
 
 ## 许可证
 

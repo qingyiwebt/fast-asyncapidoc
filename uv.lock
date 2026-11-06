@@ -70,7 +70,7 @@ wheels = [
 
 [[package]]
 name = "fast-asyncapidoc"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
@@ -86,6 +86,7 @@ yaml = [
 dev = [
     { name = "httpx" },
     { name = "pytest" },
+    { name = "pyyaml" },
     { name = "ruff" },
 ]
 
@@ -101,6 +102,7 @@ provides-extras = ["yaml"]
 dev = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "pytest", specifier = ">=9.2.0" },
+    { name = "pyyaml", specifier = ">=6" },
     { name = "ruff", specifier = ">=0.17.4" },
 ]
 

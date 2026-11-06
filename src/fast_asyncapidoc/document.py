@@ -7,19 +7,31 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
-from .decorator import OperationSpec, get_operation_specs
-from .errors import DuplicateOperationIdError, MissingYamlDependencyError
+from .decorator import (
+    OperationSpec,
+    get_channel_spec,
+    get_message_spec,
+    get_operation_specs,
+)
+from .errors import (
+    DuplicateOperationIdError,
+    DuplicateSecuritySchemeError,
+    InvalidAsyncAPIChannelError,
+    MissingYamlDependencyError,
+)
 from .scanner import WebSocketRouteInfo, iter_websocket_routes
+from .security import get_security_schemes
 
 _ASYNCAPI_VERSION = "3.0.0"
 _JSON_CONTENT_TYPE = "application/json"
 _WEBSOCKET_BINDING_VERSION = "0.1.0"
 _KEY_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
+Perspective = Literal["client", "server"]
 
 
 class AsyncAPIDoc:
@@ -33,6 +45,7 @@ class AsyncAPIDoc:
         version: str,
         description: str | None = None,
         servers: Mapping[str, Mapping[str, Any]] | None = None,
+        perspective: Perspective = "client",
     ) -> None:
         if not hasattr(app, "routes") or not hasattr(app, "add_api_route"):
             raise TypeError("app must be a FastAPI application")
@@ -42,13 +55,17 @@ class AsyncAPIDoc:
             raise ValueError("version must be a non-empty string")
         if description is not None and not isinstance(description, str):
             raise TypeError("description must be a string or None")
+        if perspective not in {"client", "server"}:
+            raise ValueError("perspective must be either 'client' or 'server'")
 
         self.app = app
         self.title = title
         self.version = version
         self.description = description
         self.servers = copy.deepcopy(dict(servers)) if servers is not None else None
+        self.perspective = perspective
         self._mounted_paths: set[str] = set()
+        self._mounted_yaml_paths: set[str] = set()
 
     def generate(self) -> dict[str, Any]:
         """Build and return a fresh AsyncAPI document dictionary."""
@@ -72,7 +89,7 @@ class AsyncAPIDoc:
         if self.servers is not None:
             document["servers"] = copy.deepcopy(self.servers)
 
-        context = _GenerationContext(document)
+        context = _GenerationContext(document, perspective=self.perspective)
         for route in iter_websocket_routes(self.app.routes):
             context.add_route(route)
         return document
@@ -80,10 +97,9 @@ class AsyncAPIDoc:
     def mount(self, path: str = "/asyncapi.json", *, name: str = "asyncapi") -> None:
         """Mount a JSON document endpoint on the FastAPI application."""
 
-        if not isinstance(path, str) or not path.startswith("/"):
-            raise ValueError("path must be an absolute route path")
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("name must be a non-empty string")
+        _validate_mount_arguments(path, name)
+        if path in self._mounted_yaml_paths:
+            raise ValueError(f"path is already mounted as YAML: {path!r}")
         if path in self._mounted_paths:
             return
 
@@ -100,9 +116,49 @@ class AsyncAPIDoc:
         )
         self._mounted_paths.add(path)
 
+    def mount_yaml(
+        self,
+        path: str = "/asyncapi.yaml",
+        *,
+        name: str = "asyncapi_yaml",
+    ) -> None:
+        """Mount a YAML document endpoint using the optional YAML extra."""
+
+        _validate_mount_arguments(path, name)
+        self._get_yaml_module()
+        if path in self._mounted_paths:
+            raise ValueError(f"path is already mounted as JSON: {path!r}")
+        if path in self._mounted_yaml_paths:
+            return
+
+        async def asyncapi_yaml() -> PlainTextResponse:
+            return PlainTextResponse(
+                content=self.to_yaml(),
+                media_type="application/yaml",
+            )
+
+        self.app.add_api_route(
+            path,
+            asyncapi_yaml,
+            methods=["GET"],
+            name=name,
+            include_in_schema=False,
+            response_class=PlainTextResponse,
+        )
+        self._mounted_yaml_paths.add(path)
+
     def to_yaml(self, *, sort_keys: bool = False) -> str:
         """Serialize the generated document as YAML using the optional extra."""
 
+        yaml = self._get_yaml_module()
+        return yaml.safe_dump(
+            self.generate(),
+            allow_unicode=True,
+            sort_keys=sort_keys,
+        )
+
+    @staticmethod
+    def _get_yaml_module() -> Any:
         try:
             import yaml
         except ImportError as exc:  # pragma: no cover - depends on installation
@@ -110,17 +166,18 @@ class AsyncAPIDoc:
                 "YAML support requires the optional dependency; install "
                 "fast-asyncapidoc[yaml]"
             ) from exc
-
-        return yaml.safe_dump(
-            self.generate(),
-            allow_unicode=True,
-            sort_keys=sort_keys,
-        )
+        return yaml
 
 
 class _GenerationContext:
-    def __init__(self, document: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        document: dict[str, Any],
+        *,
+        perspective: Perspective,
+    ) -> None:
         self.document = document
+        self.perspective = perspective
         self.channels: dict[str, Any] = document["channels"]
         self.operations: dict[str, Any] = document["operations"]
         self.schemas: dict[str, Any] = document["components"]["schemas"]
@@ -136,32 +193,28 @@ class _GenerationContext:
         channel_id = self._channel_id(route.path)
         channel = self.channels.setdefault(
             channel_id,
-            {
-                "address": route.path,
-                "bindings": {"ws": {"bindingVersion": _WEBSOCKET_BINDING_VERSION}},
-                "messages": {},
-            },
+            self._new_channel(route.path),
         )
         if channel["address"] != route.path:
             channel_id = self._unique_key(channel_id, route.path, self.channels)
             channel = self.channels.setdefault(
                 channel_id,
-                {
-                    "address": route.path,
-                    "bindings": {"ws": {"bindingVersion": _WEBSOCKET_BINDING_VERSION}},
-                    "messages": {},
-                },
+                self._new_channel(route.path),
             )
+        self._apply_channel_spec(channel, get_channel_spec(route.endpoint))
+        security_refs = self._register_security(route.endpoint)
 
         for index, spec in enumerate(specs):
             operation_id = self._operation_id(route, spec, index)
             has_inputs = bool(spec.inputs)
             has_outputs = bool(spec.outputs)
             operation: dict[str, Any] = {
-                "action": "receive" if has_inputs else "send",
+                "action": self._operation_action(spec, has_inputs),
                 "channel": {"$ref": f"#/channels/{channel_id}"},
                 "messages": [],
             }
+            if security_refs:
+                operation["security"] = copy.deepcopy(security_refs)
             self._add_operation_metadata(operation, spec)
 
             if has_inputs:
@@ -205,6 +258,76 @@ class _GenerationContext:
             self.operations[operation_id] = operation
 
     @staticmethod
+    def _new_channel(path: str) -> dict[str, Any]:
+        return {
+            "address": path,
+            "bindings": {"ws": {"bindingVersion": _WEBSOCKET_BINDING_VERSION}},
+            "messages": {},
+        }
+
+    def _apply_channel_spec(
+        self,
+        channel: dict[str, Any],
+        spec: Any,
+    ) -> None:
+        if spec is None:
+            return
+        metadata = spec.to_document()
+        for key, value in metadata.items():
+            if key in {"address", "messages"}:
+                raise InvalidAsyncAPIChannelError(
+                    f"channel metadata cannot override generated field: {key}"
+                )
+            if key == "bindings":
+                bindings = channel.setdefault("bindings", {})
+                for binding_name, binding in value.items():
+                    if (
+                        binding_name == "ws"
+                        and isinstance(binding, Mapping)
+                        and isinstance(bindings.get("ws"), Mapping)
+                    ):
+                        bindings["ws"] = {
+                            **bindings["ws"],
+                            **copy.deepcopy(dict(binding)),
+                        }
+                    else:
+                        bindings[binding_name] = copy.deepcopy(binding)
+                continue
+            existing = channel.get(key)
+            if existing is not None and existing != value:
+                raise InvalidAsyncAPIChannelError(
+                    f"conflicting channel metadata for {key!r}"
+                )
+            channel[key] = copy.deepcopy(value)
+
+    def _register_security(self, endpoint: Any) -> list[dict[str, str]]:
+        declarations = get_security_schemes(endpoint)
+        if not declarations:
+            return []
+
+        components = self.document["components"]
+        schemes = components.setdefault("securitySchemes", {})
+        references: list[dict[str, str]] = []
+        for scheme_id, scheme in declarations:
+            existing = schemes.get(scheme_id)
+            if existing is not None and existing != scheme:
+                raise DuplicateSecuritySchemeError(
+                    f"conflicting security scheme: {scheme_id!r}"
+                )
+            schemes[scheme_id] = copy.deepcopy(scheme)
+            reference = {"$ref": f"#/components/securitySchemes/{scheme_id}"}
+            if reference not in references:
+                references.append(reference)
+        return references
+
+    def _operation_action(self, spec: OperationSpec, has_inputs: bool) -> str:
+        if spec.action is not None:
+            return spec.action
+        if self.perspective == "client":
+            return "send" if has_inputs else "receive"
+        return "receive" if has_inputs else "send"
+
+    @staticmethod
     def _message_refs(channel_id: str, message_ids: list[str]) -> list[dict[str, str]]:
         return [
             {"$ref": f"#/channels/{channel_id}/messages/{message_id}"}
@@ -230,6 +353,8 @@ class _GenerationContext:
     def _add_operation_metadata(
         self, operation: dict[str, Any], spec: OperationSpec
     ) -> None:
+        if spec.action is not None:
+            operation["action"] = spec.action
         if spec.title is not None:
             operation["title"] = spec.title
         if spec.summary is not None:
@@ -270,6 +395,9 @@ class _GenerationContext:
                 message["title"] = schema["title"]
             if isinstance(schema.get("description"), str):
                 message["description"] = schema["description"]
+            message_spec = get_message_spec(model)
+            if message_spec is not None:
+                message.update(message_spec.to_document())
             self.messages[message_id] = message
 
         channel["messages"][message_id] = {
@@ -324,6 +452,13 @@ class _GenerationContext:
             candidate = f"{base}__{digest}_{counter}"
             counter += 1
         return candidate
+
+
+def _validate_mount_arguments(path: str, name: str) -> None:
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise ValueError("path must be an absolute route path")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("name must be a non-empty string")
 
 
 def _safe_key(value: str) -> str:

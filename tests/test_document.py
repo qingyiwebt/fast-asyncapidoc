@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import json
+from typing import Annotated
 
-from fastapi import APIRouter, FastAPI, WebSocket
+import pytest
+from fastapi import APIRouter, Cookie, FastAPI, Header, Query, WebSocket
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field
 
-from fast_asyncapidoc import AsyncAPIDoc, DuplicateOperationIdError, asyncapi
+from fast_asyncapidoc import (
+    AsyncAPIDoc,
+    AsyncAPISecurity,
+    DuplicateOperationIdError,
+    DuplicateSecuritySchemeError,
+    InvalidAsyncAPISecurityError,
+    asyncapi_channel,
+    asyncapi_message,
+    asyncapi_operation,
+)
 
 
 class ControlRequest(BaseModel):
@@ -43,7 +54,8 @@ def _app_with_router() -> tuple[FastAPI, AsyncAPIDoc]:
     )
 
     @router.websocket("/control")
-    @asyncapi(
+    @asyncapi_channel(description="A control channel", tags=["control"])
+    @asyncapi_operation(
         input=ControlRequest,
         output=ControlSuccess,
         operation_id="control.one",
@@ -51,12 +63,12 @@ def _app_with_router() -> tuple[FastAPI, AsyncAPIDoc]:
         description="A command with a single response.",
         tags=["control"],
     )
-    @asyncapi(
+    @asyncapi_operation(
         input=ControlRequest,
         outputs=[ControlSuccess, ControlFailure],
         operation_id="control.many",
     )
-    @asyncapi(input=ControlRequest, operation_id="control.none")
+    @asyncapi_operation(input=ControlRequest, operation_id="control.none")
     async def control(websocket: WebSocket) -> None:
         await websocket.accept()
         await websocket.close()
@@ -80,11 +92,15 @@ def test_generate_scans_prefixed_lazy_included_router() -> None:
 
     channel = document["channels"]["api_control"]
     assert channel["address"] == "/api/control"
+    assert channel["description"] == "A control channel"
+    assert channel["tags"] == [{"name": "control"}]
     assert channel["bindings"]["ws"]["bindingVersion"] == "0.1.0"
     assert len(channel["messages"]) == 3
 
     operations = document["operations"]
     assert list(operations) == ["control.one", "control.many", "control.none"]
+    assert operations["control.one"]["action"] == "send"
+    assert operations["control.none"]["action"] == "send"
     assert "reply" not in operations["control.none"]
     assert len(operations["control.one"]["reply"]["messages"]) == 1
     assert len(operations["control.many"]["reply"]["messages"]) == 2
@@ -96,12 +112,58 @@ def test_generate_scans_prefixed_lazy_included_router() -> None:
     assert request_schema["properties"]["command"]["minLength"] == 1
 
 
+def test_server_perspective_preserves_endpoint_direction() -> None:
+    app = FastAPI()
+
+    @app.websocket("/request")
+    @asyncapi_operation(
+        input=ControlRequest, output=ControlSuccess, operation_id="request"
+    )
+    async def request(websocket: WebSocket) -> None:
+        await websocket.accept()
+        await websocket.close()
+
+    @app.websocket("/events")
+    @asyncapi_operation(output=ControlSuccess, operation_id="events")
+    async def events(websocket: WebSocket) -> None:
+        await websocket.accept()
+        await websocket.close()
+
+    document = AsyncAPIDoc(
+        app,
+        title="Server",
+        version="1",
+        perspective="server",
+    ).generate()
+    assert document["operations"]["request"]["action"] == "receive"
+    assert document["operations"]["events"]["action"] == "send"
+
+
+def test_operation_action_overrides_document_perspective() -> None:
+    app = FastAPI()
+
+    @app.websocket("/events")
+    @asyncapi_operation(
+        output=ControlSuccess,
+        operation_id="events",
+        action="send",
+    )
+    async def events(websocket: WebSocket) -> None:
+        await websocket.accept()
+        await websocket.close()
+
+    operation = AsyncAPIDoc(app, title="Override", version="1").generate()[
+        "operations"
+    ]["events"]
+    assert operation["action"] == "send"
+
+
 def test_nested_schema_refs_are_rewritten_to_components() -> None:
     app = FastAPI()
     router = APIRouter()
 
     @router.websocket("/nested")
-    @asyncapi(input=NestedRequest)
+    @asyncapi_operation(input=NestedRequest)
     async def nested(websocket: WebSocket) -> None:
         await websocket.accept()
         await websocket.close()
@@ -121,7 +183,7 @@ def test_multiple_inputs_and_outputs_are_alternative_messages() -> None:
     app = FastAPI()
 
     @app.websocket("/multi")
-    @asyncapi(
+    @asyncapi_operation(
         inputs=[ControlRequest, NestedRequest],
         outputs=[ControlSuccess, ControlFailure],
         operation_id="multi",
@@ -137,11 +199,14 @@ def test_multiple_inputs_and_outputs_are_alternative_messages() -> None:
     assert len(document["channels"]["multi"]["messages"]) == 4
 
 
-def test_output_only_generates_send_operation_without_reply() -> None:
+def test_output_only_generates_receive_operation_without_reply() -> None:
     app = FastAPI()
 
     @app.websocket("/events")
-    @asyncapi(outputs=[ControlSuccess, ControlFailure], operation_id="events")
+    @asyncapi_operation(
+        outputs=[ControlSuccess, ControlFailure],
+        operation_id="events",
+    )
     async def events(websocket: WebSocket) -> None:
         await websocket.accept()
         await websocket.close()
@@ -149,7 +214,7 @@ def test_output_only_generates_send_operation_without_reply() -> None:
     document = AsyncAPIDoc(app, title="Events", version="1").generate()
     operation = document["operations"]["events"]
 
-    assert operation["action"] == "send"
+    assert operation["action"] == "receive"
     assert len(operation["messages"]) == 2
     assert "reply" not in operation
     assert all(
@@ -158,11 +223,11 @@ def test_output_only_generates_send_operation_without_reply() -> None:
     )
 
 
-def test_empty_inputs_with_outputs_generates_send_operation() -> None:
+def test_empty_inputs_with_outputs_generates_receive_operation() -> None:
     app = FastAPI()
 
     @app.websocket("/events")
-    @asyncapi(inputs=[], output=ControlSuccess, operation_id="events")
+    @asyncapi_operation(inputs=[], output=ControlSuccess, operation_id="events")
     async def events(websocket: WebSocket) -> None:
         await websocket.accept()
         await websocket.close()
@@ -170,7 +235,7 @@ def test_empty_inputs_with_outputs_generates_send_operation() -> None:
     operation = AsyncAPIDoc(app, title="Events", version="1").generate()["operations"][
         "events"
     ]
-    assert operation["action"] == "send"
+    assert operation["action"] == "receive"
     assert len(operation["messages"]) == 1
     assert "reply" not in operation
 
@@ -179,20 +244,154 @@ def test_stacked_operations_cover_all_supported_combinations() -> None:
     app = FastAPI()
 
     @app.websocket("/all")
-    @asyncapi(output=ControlSuccess, operation_id="push")
-    @asyncapi(input=ControlRequest, operation_id="receive_only")
-    @asyncapi(input=ControlRequest, output=ControlFailure, operation_id="request_reply")
+    @asyncapi_operation(output=ControlSuccess, operation_id="push")
+    @asyncapi_operation(input=ControlRequest, operation_id="receive_only")
+    @asyncapi_operation(
+        input=ControlRequest,
+        output=ControlFailure,
+        operation_id="request_reply",
+    )
     async def all_combinations(websocket: WebSocket) -> None:
         await websocket.accept()
         await websocket.close()
 
     operations = AsyncAPIDoc(app, title="All", version="1").generate()["operations"]
     assert list(operations) == ["push", "receive_only", "request_reply"]
-    assert operations["push"]["action"] == "send"
-    assert operations["receive_only"]["action"] == "receive"
+    assert operations["push"]["action"] == "receive"
+    assert operations["receive_only"]["action"] == "send"
     assert "reply" not in operations["receive_only"]
-    assert operations["request_reply"]["action"] == "receive"
+    assert operations["request_reply"]["action"] == "send"
     assert "reply" in operations["request_reply"]
+
+
+def test_message_metadata_is_reused_for_every_message_reference() -> None:
+    @asyncapi_message(
+        title="Documented event",
+        description="An event with message metadata.",
+        correlation_id={
+            "description": "Correlation value",
+            "location": "$message.payload#/echo",
+        },
+        examples=[{"name": "event", "payload": {"value": 1}}],
+        extra={"x-owner": "tests"},
+    )
+    class DocumentedEvent(BaseModel):
+        value: int
+
+    app = FastAPI()
+
+    @app.websocket("/events")
+    @asyncapi_operation(
+        input=DocumentedEvent,
+        output=DocumentedEvent,
+        operation_id="events",
+    )
+    async def events(websocket: WebSocket) -> None:
+        await websocket.accept()
+        await websocket.close()
+
+    document = AsyncAPIDoc(app, title="Messages", version="1").generate()
+    messages = document["components"]["messages"]
+    assert messages["events_input_DocumentedEvent"]["title"] == "Documented event"
+    assert messages["events_output_DocumentedEvent"]["description"] == (
+        "An event with message metadata."
+    )
+    assert (
+        messages["events_input_DocumentedEvent"]["correlationId"]["location"]
+        == "$message.payload#/echo"
+    )
+    assert messages["events_output_DocumentedEvent"]["examples"] == [
+        {"name": "event", "payload": {"value": 1}}
+    ]
+    assert messages["events_input_DocumentedEvent"]["x-owner"] == "tests"
+
+
+def test_security_markers_infer_query_header_and_cookie() -> None:
+    app = FastAPI()
+
+    @app.websocket("/security")
+    @asyncapi_operation(input=ControlRequest, operation_id="security")
+    async def security(
+        websocket: WebSocket,
+        query_key: Annotated[
+            str | None,
+            AsyncAPISecurity(
+                scheme_id="queryKey",
+                description="Query key",
+            ),
+        ] = Query(default=None),
+        header_key: Annotated[
+            str | None,
+            AsyncAPISecurity(scheme_id="headerKey"),
+        ] = Header(default=None, alias="X-API-Key"),
+        cookie_key: Annotated[
+            str | None,
+            AsyncAPISecurity(scheme_id="cookieKey"),
+        ] = Cookie(default=None),
+    ) -> None:
+        await websocket.accept()
+        await websocket.close()
+
+    document = AsyncAPIDoc(app, title="Security", version="1").generate()
+    schemes = document["components"]["securitySchemes"]
+    assert schemes["queryKey"] == {
+        "type": "httpApiKey",
+        "name": "query_key",
+        "in": "query",
+        "description": "Query key",
+    }
+    assert schemes["headerKey"]["name"] == "X-API-Key"
+    assert schemes["headerKey"]["in"] == "header"
+    assert schemes["cookieKey"]["name"] == "cookie_key"
+    assert schemes["cookieKey"]["in"] == "cookie"
+    assert document["operations"]["security"]["security"] == [
+        {"$ref": "#/components/securitySchemes/queryKey"},
+        {"$ref": "#/components/securitySchemes/headerKey"},
+        {"$ref": "#/components/securitySchemes/cookieKey"},
+    ]
+
+
+def test_security_scheme_conflict_fails() -> None:
+    app = FastAPI()
+
+    @app.websocket("/one")
+    @asyncapi_operation(input=ControlRequest, operation_id="one")
+    async def one(
+        websocket: WebSocket,
+        key: Annotated[str | None, AsyncAPISecurity(scheme_id="shared")] = Query(
+            default=None
+        ),
+    ) -> None:
+        pass
+
+    @app.websocket("/two")
+    @asyncapi_operation(input=ControlRequest, operation_id="two")
+    async def two(
+        websocket: WebSocket,
+        key: Annotated[
+            str | None,
+            AsyncAPISecurity(scheme_id="shared", description="different"),
+        ] = Query(default=None),
+    ) -> None:
+        pass
+
+    with pytest.raises(DuplicateSecuritySchemeError, match="shared"):
+        AsyncAPIDoc(app, title="Security", version="1").generate()
+
+
+def test_security_marker_requires_fastapi_parameter_metadata() -> None:
+    app = FastAPI()
+
+    @app.websocket("/security")
+    @asyncapi_operation(input=ControlRequest, operation_id="security")
+    async def security(
+        websocket: WebSocket,
+        key: Annotated[str | None, AsyncAPISecurity(scheme_id="key")] = None,
+    ) -> None:
+        pass
+
+    with pytest.raises(InvalidAsyncAPISecurityError, match="Query"):
+        AsyncAPIDoc(app, title="Security", version="1").generate()
 
 
 def test_nested_included_routers_keep_all_prefixes() -> None:
@@ -201,7 +400,7 @@ def test_nested_included_routers_keep_all_prefixes() -> None:
     parent = APIRouter(prefix="/parent")
 
     @child.websocket("/control")
-    @asyncapi(input=ControlRequest, operation_id="nested")
+    @asyncapi_operation(input=ControlRequest, operation_id="nested")
     async def nested(websocket: WebSocket) -> None:
         await websocket.accept()
         await websocket.close()
@@ -240,13 +439,13 @@ def test_same_model_name_is_disambiguated() -> None:
     app = FastAPI()
 
     @app.websocket("/one")
-    @asyncapi(input=SameNameOne, operation_id="one")
+    @asyncapi_operation(input=SameNameOne, operation_id="one")
     async def one(websocket: WebSocket) -> None:
         await websocket.accept()
         await websocket.close()
 
     @app.websocket("/two")
-    @asyncapi(input=SameNameTwo, operation_id="two")
+    @asyncapi_operation(input=SameNameTwo, operation_id="two")
     async def two(websocket: WebSocket) -> None:
         await websocket.accept()
         await websocket.close()
@@ -272,11 +471,22 @@ def test_mount_returns_fresh_json_and_does_not_change_openapi() -> None:
     assert app.openapi() == before
 
 
+def test_mount_yaml_returns_asyncapi_document() -> None:
+    yaml = pytest.importorskip("yaml")
+    app, doc = _app_with_router()
+    doc.mount_yaml("/asyncapi.yaml")
+
+    response = TestClient(app).get("/asyncapi.yaml")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/yaml")
+    assert yaml.safe_load(response.text) == doc.generate()
+
+
 def test_websocket_endpoint_still_works_after_decoration() -> None:
     app = FastAPI()
 
     @app.websocket("/ws")
-    @asyncapi(input=ControlRequest)
+    @asyncapi_operation(input=ControlRequest)
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.accept()
         await websocket.send_json({"accepted": True})
@@ -290,18 +500,14 @@ def test_duplicate_explicit_operation_id_fails() -> None:
     app = FastAPI()
 
     @app.websocket("/one")
-    @asyncapi(input=ControlRequest, operation_id="duplicate")
+    @asyncapi_operation(input=ControlRequest, operation_id="duplicate")
     async def one(websocket: WebSocket) -> None:
         pass
 
     @app.websocket("/two")
-    @asyncapi(input=ControlRequest, operation_id="duplicate")
+    @asyncapi_operation(input=ControlRequest, operation_id="duplicate")
     async def two(websocket: WebSocket) -> None:
         pass
 
-    try:
+    with pytest.raises(DuplicateOperationIdError, match="duplicate"):
         AsyncAPIDoc(app, title="Test", version="1").generate()
-    except DuplicateOperationIdError as exc:
-        assert "duplicate" in str(exc)
-    else:  # pragma: no cover
-        raise AssertionError("expected DuplicateOperationIdError")

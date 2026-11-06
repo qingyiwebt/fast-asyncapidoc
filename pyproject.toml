@@ -1,6 +1,6 @@
 [project]
 name = "fast-asyncapidoc"
-version = "0.1.0"
+version = "0.2.0"
 description = "Generate AsyncAPI 3 documentation for FastAPI WebSocket endpoints"
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
@@ -56,6 +56,7 @@ source-include = ["README.zh-CN.md"]
 [dependency-groups]
 dev = [
     "httpx>=0.28.1",
+    "pyyaml>=6",
     "pytest>=9.2.0",
     "ruff>=0.17.4",
 ]
